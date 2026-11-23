@@ -42,7 +42,7 @@ local Config = {
 	RecreateHierarchy = true,
 	ThreadingSpeed = "Medium",
 	CleanHeaders = true,
-	MaxFileSize = 1024 * 1024 * 3,
+	MaxDecompileSize = 1024 * 1024 * 3,
 	ScanThreats = true,
 	KeywordFilterActive = false,
 	KeywordFilterText = "",
@@ -51,6 +51,11 @@ local Config = {
 	TargetedDumpActive = false,
 	TargetedDumpPath = "",
 	NetworkSpyActive = false,
+	DumpRemotes = true,
+	DumpTree = true,
+	CaptureIncoming = false,
+	MaxCallSites = 20000,
+	MaxTreeLines = 250000,
 	Services = {
 		Workspace = true,
 		ReplicatedStorage = true,
@@ -58,12 +63,14 @@ local Config = {
 		StarterGui = true,
 		StarterPack = true,
 		StarterPlayer = true,
-		Chat = false,
-		SoundService = false,
-		Lighting = false,
+		Chat = true,
+		SoundService = true,
+		Lighting = true,
 		Players = true,
 		Teams = true,
-		MaterialService = false,
+		MaterialService = true,
+		ServerScriptService = true,
+		ServerStorage = true,
 	},
 }
 
@@ -611,6 +618,62 @@ createToggleSetting("NetworkSpyActive", "Network Event Scanner",            "Lis
 	end
 )
 
+createToggleSetting("DumpRemotes", "Dump Remotes", "Writes remotes.txt with every RemoteEvent / RemoteFunction path.")
+createToggleSetting("DumpTree", "Full Instance Tree", "Writes game_tree.txt with every instance path (capped by MaxTreeLines).")
+createToggleSetting("CaptureIncoming", "Capture Incoming Remotes", "Logs args of OnClientEvent to captured_args.txt while on.", function(val)
+	if setIncomingCapture then setIncomingCapture(val) end
+end)
+
+do
+	-- decompile size cap (bytecode bytes): 1 / 3 / 8 / 32 MB / unlimited
+	local CAP_STEPS = { 1, 3, 8, 32, 0 }
+	local capFrame = Instance.new("Frame")
+	capFrame.Size = UDim2.new(1, 0, 0, 40)
+	capFrame.BackgroundTransparency = 1
+	capFrame.Parent = SettingsTab
+
+	local capTitle = Instance.new("TextLabel")
+	capTitle.Size = UDim2.new(0.6, 0, 1, 0)
+	capTitle.BackgroundTransparency = 1
+	capTitle.Text = "Decompile Size Cap (bytecode):"
+	capTitle.TextColor3 = Color3.fromRGB(230, 230, 240)
+	capTitle.Font = Enum.Font.GothamBold
+	capTitle.TextSize = 13
+	capTitle.TextXAlignment = Enum.TextXAlignment.Left
+	capTitle.Parent = capFrame
+
+	local capBtn = Instance.new("TextButton")
+	capBtn.Size = UDim2.new(0, 110, 0, 26)
+	capBtn.Position = UDim2.new(1, -110, 0.5, -13)
+	capBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+	capBtn.TextColor3 = Color3.fromRGB(240, 240, 250)
+	capBtn.Font = Enum.Font.GothamBold
+	capBtn.TextSize = 12
+	capBtn.Parent = capFrame
+	Instance.new("UICorner", capBtn).CornerRadius = UDim.new(0, 6)
+
+	local function capLabel(mb)
+		if mb == 0 then return "unlimited" end
+		return tostring(mb) .. " MB"
+	end
+	local function currentCapMB()
+		return math.floor(Config.MaxDecompileSize / (1024 * 1024) + 0.5)
+	end
+	capBtn.Text = capLabel(currentCapMB())
+	capBtn.MouseButton1Click:Connect(function()
+		local cur = currentCapMB()
+		local nextMB = CAP_STEPS[1]
+		for i, mb in ipairs(CAP_STEPS) do
+			if mb == cur then
+				nextMB = CAP_STEPS[(i % #CAP_STEPS) + 1]
+				break
+			end
+		end
+		Config.MaxDecompileSize = nextMB * 1024 * 1024
+		capBtn.Text = capLabel(nextMB)
+	end)
+end
+
 -- Speed Buttons
 local speedFrame = Instance.new("Frame")
 speedFrame.Size = UDim2.new(1, 0, 0, 40)
@@ -1026,12 +1089,31 @@ local function safeStr(s)
 	return s
 end
 
+local function fullNameOf(inst)
+	local ok, fn = pcall(function() return inst:GetFullName() end)
+	if ok and fn then return fn end
+	return "<unnamed>"
+end
+
+local function classOf(inst)
+	local ok, cn = pcall(function() return inst.ClassName end)
+	if ok and cn then return cn end
+	return "?"
+end
+
+-- appendfile is one write per line; the read-whole-file-then-rewrite path stays as fallback
 local function logToFile(fileName, content)
-	local current = ""
-	pcall(function()
-		if isfile(fileName) then current = readfile(fileName) or "" end
-	end)
-	pcall(writefile, fileName, current .. content .. "\n\n")
+	local appended = false
+	if appendfile then
+		appended = pcall(appendfile, fileName, content .. "\n\n")
+	end
+	if not appended then
+		local current = ""
+		pcall(function()
+			if isfile(fileName) then current = readfile(fileName) or "" end
+		end)
+		pcall(writefile, fileName, current .. content .. "\n\n")
+	end
 end
 
 local function bcHash(bc)
@@ -1089,6 +1171,8 @@ end
 -- CORE CONSTANTS
 -- =================================================================
 local global_seen_bc = {}
+local aliasLines = {}
+local sharedGC = nil
 local lastYield = os.clock()
 
 local function checkYield()
@@ -1146,8 +1230,7 @@ end
 -- =================================================================
 -- PHASE 1: SCAN - Collect all unique scripts
 -- =================================================================
-local function runScanPhase()
-	local queue    = {}     -- { inst, bc, tag }
+local function runScanPhase(queue)
 	local seenPtr  = {}     -- [instance] = true (pointer dedup)
 	local scanTotal = 0
 
@@ -1176,13 +1259,17 @@ local function runScanPhase()
 
 		-- Bytecode hash dedup
 		if bc ~= "" then
-			local hash = bcHash(bc)
-			if hash and global_seen_bc[hash] then
+			local firstPath = global_seen_bc[bc]
+			if firstPath then
 				total_skip += 1
 				updateStats()
+				local thisPath = fullNameOf(inst)
+				if thisPath ~= firstPath then
+					table.insert(aliasLines, thisPath .. "  ->  " .. firstPath)
+				end
 				return
 			end
-			if hash then global_seen_bc[hash] = true end
+			global_seen_bc[bc] = fullNameOf(inst)
 		end
 
 		seenPtr[inst] = true
@@ -1264,6 +1351,7 @@ local function runScanPhase()
 	-- ── Method 5: GC - script instances ────────────────────────
 	addLog("── [M5] getgc() – script instances", Color3.fromRGB(150, 80, 255))
 	local okGC, gcData = pcall(getgc, true)
+	sharedGC = okGC and gcData or nil
 	if okGC and gcData then
 		local cnt = 0
 		for _, v in next, gcData do
@@ -1341,10 +1429,15 @@ local function runDecompilePhase(queue)
 			end
 		end
 
-		-- Size filter
-		if bc ~= "" and #bc > Config.MaxFileSize then
-			addLog("[SKIP:SIZE] " .. baseName, Color3.fromRGB(240, 100, 100))
-			total_skip += 1; updateStats()
+		-- Size filter: too big to decompile safely -> keep bytecode only
+		if bc ~= "" and Config.MaxDecompileSize > 0 and #bc > Config.MaxDecompileSize then
+			addLog("[BC-ONLY:SIZE] " .. baseName, Color3.fromRGB(240, 180, 100))
+			local bigPath = getFullGamePath(realInst)
+			if bigPath == "" then bigPath = getFullGamePath(inst) end
+			table.insert(results, {
+				name = baseName, src = nil, bc = bc, bcOnly = true,
+				gamePath = bigPath, tag = item.tag, cls = classOf(realInst), rawName = name,
+			})
 			doneCount += 1; setPhaseStatus("decompile", doneCount, #queue)
 			continue
 		end
@@ -1427,6 +1520,8 @@ local function runDecompilePhase(queue)
 				bc       = bc,
 				gamePath = gamePath,
 				tag      = item.tag,
+				cls      = classOf(realInst),
+				rawName = name,
 			})
 		else
 			total_skip += 1
@@ -1438,7 +1533,7 @@ local function runDecompilePhase(queue)
 
 	-- GC Closure scan (functions in memory, not bound to instances)
 	addLog("── GC Closure scan...", Color3.fromRGB(150, 80, 255))
-	local okGC, gcData = pcall(getgc, true)
+	local okGC, gcData = sharedGC ~= nil, sharedGC
 	if okGC and gcData and decompile then
 		local closureCnt = 0
 		for _, v in next, gcData do
@@ -1469,6 +1564,7 @@ local function runDecompilePhase(queue)
 		addLog(string.format("     → %d GC closures decompiled", closureCnt), Color3.fromRGB(100, 200, 255))
 	end
 
+	sharedGC = nil
 	addLog(string.format("✓ Decompiling: %d results, %d GC closures.", #results, #gcClosures), Color3.fromRGB(80, 255, 140))
 	return results, gcClosures
 end
@@ -1544,7 +1640,7 @@ local function runWritePhase(results, gcClosures)
 				total_skip += 1
 				updateStats()
 			end
-		elseif Config.FallbackBytecode and bc ~= "" then
+		elseif (Config.FallbackBytecode or item.bcOnly) and bc ~= "" then
 			local finalPath = getUniquePath(writePath, ".luac")
 			pcall(createFoldersForPath, finalPath)
 			pcall(ensureDir, folderPath)
@@ -1584,6 +1680,728 @@ local function runWritePhase(results, gcClosures)
 end
 
 -- =================================================================
+-- EXTRA PHASE: ALL REMOTES + FULL INSTANCE TREE
+-- =================================================================
+local REMOTE_CLASSES = {
+	RemoteEvent = true,
+	UnreliableRemoteEvent = true,
+	RemoteFunction = true,
+	BindableEvent = true,
+	BindableFunction = true,
+}
+
+
+-- snapshot helpers: compare against the previous dump sitting in the same folder
+local function readLines(path)
+	local set = {}
+	local ok, content = pcall(function()
+		if isfile and isfile(path) then return readfile(path) end
+		return nil
+	end)
+	if ok and type(content) == "string" then
+		for line in string.gmatch(content .. "\n", "([^\n]*)\n") do
+			if line ~= "" and string.sub(line, 1, 1) ~= "#" then
+				set[line] = true
+			end
+		end
+	end
+	return set
+end
+
+local function writeDiff(path, label, oldSet, newLines)
+	local newSet = {}
+	for _, l in ipairs(newLines) do
+		if l ~= "" and string.sub(l, 1, 1) ~= "#" then
+			newSet[l] = true
+		end
+	end
+
+	local out = {}
+	if next(oldSet) == nil then
+		table.insert(out, "no previous " .. label .. " snapshot, nothing to compare yet")
+	else
+		local added, removed = {}, {}
+		for l in pairs(newSet) do
+			if not oldSet[l] then table.insert(added, l) end
+		end
+		for l in pairs(oldSet) do
+			if not newSet[l] then table.insert(removed, l) end
+		end
+		table.sort(added)
+		table.sort(removed)
+		table.insert(out, "ADDED " .. label .. ": " .. tostring(#added))
+		for _, l in ipairs(added) do table.insert(out, "  + " .. l) end
+		table.insert(out, "REMOVED " .. label .. ": " .. tostring(#removed))
+		for _, l in ipairs(removed) do table.insert(out, "  - " .. l) end
+	end
+
+	ensureDir(OUT_DIR)
+	pcall(writefile, path, table.concat(out, "\n"))
+end
+
+local function runRemotePhase()
+	local oldRemotes = readLines(OUT_DIR .. "/remotes.txt")
+	local seen, remotes, treeLines = {}, {}, {}
+
+	local function visit(inst, nilTag)
+		if seen[inst] then return end
+		seen[inst] = true
+		local ok, cn = pcall(function() return inst.ClassName end)
+		if not ok or not cn then return end
+		local full = fullNameOf(inst)
+		if nilTag then full = "[NIL] " .. full end
+		if REMOTE_CLASSES[cn] then
+			table.insert(remotes, { cn = cn, path = full })
+		end
+		if Config.DumpTree and #treeLines < Config.MaxTreeLines then
+			table.insert(treeLines, cn .. "  " .. full)
+		end
+	end
+
+	-- R1: everything under game
+	addLog("── [R1] game:GetDescendants()", Color3.fromRGB(150, 80, 255))
+	local okD, desc = pcall(function() return game:GetDescendants() end)
+	if okD and desc then
+		for _, inst in ipairs(desc) do
+			visit(inst)
+			checkYield()
+		end
+		addLog(string.format("     → %d instances", #desc), Color3.fromRGB(100, 200, 255))
+	else
+		addLog("     [ERR] GetDescendants failed", Color3.fromRGB(220, 80, 80))
+	end
+
+	-- R2: getinstances() catches what the tree walk can't reach
+	if getinstances then
+		local okI, insts = pcall(getinstances)
+		if okI and insts then
+			for _, inst in ipairs(insts) do
+				visit(inst)
+				checkYield()
+			end
+			addLog(string.format("── [R2] getinstances() → %d", #insts), Color3.fromRGB(100, 200, 255))
+		end
+	end
+
+	-- R3: nil-parented instances (remotes held only by scripts)
+	if getnilinstances then
+		local okN, nils = pcall(getnilinstances)
+		if okN and nils then
+			for _, inst in ipairs(nils) do
+				visit(inst, true)
+				checkYield()
+			end
+			addLog(string.format("── [R3] getnilinstances() → %d", #nils), Color3.fromRGB(100, 200, 255))
+		end
+	end
+
+	-- write remotes list
+	table.sort(remotes, function(a, b) return a.path < b.path end)
+	local rLines = { "# " .. #remotes .. " remotes", "" }
+	for _, r in ipairs(remotes) do
+		table.insert(rLines, string.format("[%s] %s", r.cn, r.path))
+		addLog(string.format("[REMOTE] %s", r.path), Color3.fromRGB(80, 220, 240))
+	end
+	ensureDir(OUT_DIR)
+	if Config.DumpRemotes then
+		pcall(writefile, OUT_DIR .. "/remotes.txt", table.concat(rLines, "\n"))
+		writeDiff(OUT_DIR .. "/changes_remotes.txt", "remotes", oldRemotes, rLines)
+	end
+
+	if Config.DumpTree then
+		pcall(writefile, OUT_DIR .. "/game_tree.txt", table.concat(treeLines, "\n"))
+	end
+
+	return #remotes, #treeLines, remotes
+end
+
+
+-- =================================================================
+-- INDEX PHASE: CALL SITES, VALUES/ATTRIBUTES, SUMMARY
+-- =================================================================
+local CALL_KINDS = { "FireServer", "InvokeServer", "FireClient", "FireAllClients", "InvokeClient" }
+local RECV_KINDS = { "OnClientEvent", "OnClientInvoke" }
+
+local function trimLine(s)
+	s = string.gsub(s, "^%s+", "")
+	s = string.gsub(s, "%s+$", "")
+	return s
+end
+
+-- drop a trailing "-- comment" and trailing separators
+local function cleanExpr(s)
+	s = string.gsub(s, "%-%-.*$", "")
+	s = string.gsub(s, "[;,]%s*$", "")
+	return trimLine(s)
+end
+
+-- set -> sorted list, optionally capped with a "... (+N)" tail
+local function setToList(set, cap)
+	local list = {}
+	for k in pairs(set) do
+		table.insert(list, k)
+	end
+	table.sort(list)
+	if cap and #list > cap then
+		local short = {}
+		for i = 1, cap do
+			table.insert(short, list[i])
+		end
+		table.insert(short, "... (+" .. tostring(#list - cap) .. ")")
+		return short
+	end
+	return list
+end
+
+local function joinSet(set, cap)
+	local list = setToList(set, cap)
+	if #list == 0 then return "-" end
+	return table.concat(list, ", ")
+end
+
+-- best-effort: which instance name does an expression point at
+local function nameFromExpr(expr)
+	expr = cleanExpr(expr or "")
+	local bracket = string.match(expr, "%[%s*[\"']([^\"']+)[\"']%s*%]$")
+	if bracket then return bracket end
+	local dotted = string.match(expr, "%.([%w_]+)$")
+	if dotted then return dotted end
+	local last = nil
+	for nm in string.gmatch(expr, "WaitForChild%(%s*[\"']([^\"']+)") do
+		last = nm
+	end
+	for nm in string.gmatch(expr, "FindFirstChild%(%s*[\"']([^\"']+)") do
+		last = nm
+	end
+	if last then return last end
+	return string.match(expr, "([%w_]+)$")
+end
+
+-- split "a, {b, c}, 'd'" on top-level commas (quotes and brackets respected)
+local function splitArgs(text)
+	local args, cur = {}, {}
+	local depth, q = 0, nil
+	local i, n = 1, #text
+	while i <= n do
+		local c = string.sub(text, i, i)
+		if q then
+			table.insert(cur, c)
+			if c == "\\" and i < n then
+				i += 1
+				table.insert(cur, string.sub(text, i, i))
+			elseif c == q then
+				q = nil
+			end
+		elseif c == "\"" or c == "'" then
+			q = c
+			table.insert(cur, c)
+		elseif c == "(" or c == "{" or c == "[" then
+			depth = depth + 1
+			table.insert(cur, c)
+		elseif c == ")" or c == "}" or c == "]" then
+			depth = depth - 1
+			table.insert(cur, c)
+		elseif c == "," and depth == 0 then
+			table.insert(args, trimLine(table.concat(cur)))
+			cur = {}
+		else
+			table.insert(cur, c)
+		end
+		i += 1
+	end
+	local last = trimLine(table.concat(cur))
+	if last ~= "" then
+		table.insert(args, last)
+	end
+	return args
+end
+
+-- text between the "(" at openPos and its matching ")", plus whether it closed
+local function extractArgs(src, openPos)
+	local depth, q = 0, nil
+	local i = openPos
+	local limit = math.min(#src, openPos + 1500)
+	while i <= limit do
+		local c = string.sub(src, i, i)
+		if q then
+			if c == "\\" then
+				i += 1
+			elseif c == q then
+				q = nil
+			end
+		elseif c == "\"" or c == "'" then
+			q = c
+		elseif c == "(" then
+			depth = depth + 1
+		elseif c == ")" then
+			depth = depth - 1
+			if depth == 0 then
+				return string.sub(src, openPos + 1, i - 1), true
+			end
+		end
+		i += 1
+	end
+	return string.sub(src, openPos + 1, limit), false
+end
+
+local function buildLineIndex(src)
+	local starts = { 1 }
+	local pos = 1
+	while true do
+		local nl = string.find(src, "\n", pos, true)
+		if not nl then break end
+		table.insert(starts, nl + 1)
+		pos = nl + 1
+	end
+	return starts
+end
+
+-- 1-based line number that contains byte position pos
+local function lineOf(starts, pos)
+	local lo, hi = 1, #starts
+	while lo < hi do
+		local mid = math.floor((lo + hi + 1) / 2)
+		if starts[mid] <= pos then
+			lo = mid
+		else
+			hi = mid - 1
+		end
+	end
+	return lo
+end
+
+-- chain text (Remotes.Foo, Remote, Remotes["X"], WaitForChild("X")) -> remote name
+local function resolveRemote(src, chain, cache)
+	if cache[chain] then return cache[chain] end
+	local name = nil
+	if string.match(chain, "^[%w_]+$") then
+		-- plain variable: follow its local assignment once
+		local rhs = string.match(src, "local%s+" .. chain .. "%s*=%s*([^\n]+)")
+		if rhs then name = nameFromExpr(rhs) end
+	else
+		name = nameFromExpr(chain)
+	end
+	name = name or chain
+	cache[chain] = name
+	return name
+end
+
+-- receiver expression sitting right before ":Method(" or ".Event" (pre = text before it)
+local function chainAt(pre)
+	return string.match(pre, "([%w_]+%b())$")
+		or string.match(pre, "([%w_%.]*%[%s*[\"'][^\"'\n]*[\"']%s*%])$")
+		or string.match(pre, "([%w_%.%[%]\"']+)$")
+		or "?"
+end
+
+-- every remote call (out) and handler (in) inside one decompiled source
+local function scanRemoteSites(src, where, info, ctx)
+	local starts = nil
+	local cache = {}
+
+	local function addSite(kind, rname, dir, pos, detail)
+		local u = ctx.usage[rname]
+		if not u then
+			u = { out = {}, ["in"] = {} }
+			ctx.usage[rname] = u
+		end
+		u[dir][where] = true
+		if dir == "out" then
+			ctx.byOut[rname] = (ctx.byOut[rname] or 0) + 1
+			info.outRemotes[rname] = true
+		else
+			ctx.byIn[rname] = (ctx.byIn[rname] or 0) + 1
+			info.inRemotes[rname] = true
+		end
+		ctx.totalCalls = ctx.totalCalls + 1
+
+		if ctx.callLinesCount < Config.MaxCallSites then
+			ctx.callLinesCount = ctx.callLinesCount + 1
+			if not starts then starts = buildLineIndex(src) end
+			local line = lineOf(starts, pos)
+			table.insert(ctx.callLines, string.format("[%s] %s  @ %s : line %d", kind, rname, where, line))
+			table.insert(ctx.callLines, "    " .. detail)
+		end
+	end
+
+	for _, kind in ipairs(CALL_KINDS) do
+		local needle = ":" .. kind .. "("
+		local pos = 1
+		while true do
+			local s = string.find(src, needle, pos, true)
+			if not s then break end
+			pos = s + #needle
+			local pre = string.sub(src, math.max(1, s - 160), s - 1)
+			local chain = chainAt(pre)
+			local rname = resolveRemote(src, chain, cache)
+			local argText, complete = extractArgs(src, pos - 1)
+			local flat = string.gsub(argText, "%s+", " ")
+			local parts = {}
+			for ai, a in ipairs(splitArgs(flat)) do
+				if ai > 12 then break end
+				table.insert(parts, "[" .. tostring(ai) .. "] " .. string.sub(a, 1, 160))
+			end
+			local detail = "args: " .. (#parts > 0 and table.concat(parts, "  ") or "(none)")
+			if not complete then detail = detail .. "  ...(cut)" end
+			addSite(kind, rname, "out", s, detail)
+		end
+	end
+
+	for _, kind in ipairs(RECV_KINDS) do
+		local needle = "." .. kind
+		local pos = 1
+		while true do
+			local s, e = string.find(src, needle, pos, true)
+			if not s then break end
+			pos = e + 1
+			local pre = string.sub(src, math.max(1, s - 160), s - 1)
+			local chain = chainAt(pre)
+			local rname = resolveRemote(src, chain, cache)
+			local ahead = string.sub(src, e + 1, e + 240)
+			local params = string.match(ahead, "^%s*:%s*Connect%s*%(%s*function%s*%(([^%)]*)%)")
+				or string.match(ahead, "^%s*=%s*function%s*%(([^%)]*)%)")
+				or "?"
+			addSite(kind, rname, "in", s, "params: (" .. params .. ")")
+		end
+	end
+end
+
+-- values, attributes, object props and tags across the whole game
+local function dumpValues()
+	local VALUE_CLASSES = {
+		BoolValue = true, IntValue = true, NumberValue = true, StringValue = true,
+		ObjectValue = true, Vector3Value = true, CFrameValue = true,
+		Color3Value = true, BrickColorValue = true,
+	}
+	local OBJECT_PROPS = {
+		ProximityPrompt = { "ActionText", "ObjectText", "KeyboardKeyCode", "HoldDuration", "MaxActivationDistance", "Enabled", "RequiresLineOfSight" },
+		ClickDetector   = { "MaxActivationDistance" },
+		Tool            = { "RequiresHandle", "CanBeDropped", "Enabled", "ToolTip" },
+		Animation       = { "AnimationId" },
+		Sound           = { "SoundId", "Volume", "Looped" },
+		Team            = { "TeamColor", "AutoAssignable" },
+		SpawnLocation   = { "Enabled", "Neutral" },
+		Humanoid        = { "WalkSpeed", "JumpPower", "JumpHeight", "MaxHealth", "HipHeight" },
+	}
+
+	local valLines, objLines, tagTable = {}, {}, {}
+	local count = 0
+
+	local okD, desc = pcall(function() return game:GetDescendants() end)
+	if okD and desc then
+		for _, inst in ipairs(desc) do
+			local cn = classOf(inst)
+
+			if VALUE_CLASSES[cn] then
+				local okV, v = pcall(function() return inst.Value end)
+				local vs = "?"
+				if okV then
+					if typeof(v) == "Instance" then vs = fullNameOf(v) else vs = tostring(v) end
+				end
+				table.insert(valLines, string.format("[%s] %s = %s", cn, fullNameOf(inst), vs))
+				count += 1
+			end
+
+			local props = OBJECT_PROPS[cn]
+			if props then
+				local parts = {}
+				for _, p in ipairs(props) do
+					local okP, pv = pcall(function() return inst[p] end)
+					table.insert(parts, p .. "=" .. (okP and tostring(pv) or "?"))
+				end
+				table.insert(objLines, string.format("[%s] %s  |  %s", cn, fullNameOf(inst), table.concat(parts, ", ")))
+			end
+
+			local okA, attrs = pcall(function() return inst:GetAttributes() end)
+			if okA and attrs then
+				for k, v in pairs(attrs) do
+					table.insert(valLines, string.format("[ATTR] %s @ %s = %s (%s)", tostring(k), fullNameOf(inst), tostring(v), typeof(v)))
+					count += 1
+				end
+			end
+
+			local okT, tags = pcall(function() return inst:GetTags() end)
+			if okT and tags then
+				for _, t in ipairs(tags) do
+					local e = tagTable[t]
+					if not e then
+						e = { count = 0, example = fullNameOf(inst) }
+						tagTable[t] = e
+					end
+					e.count = e.count + 1
+				end
+			end
+
+			checkYield()
+		end
+	end
+
+	table.sort(valLines)
+	table.sort(objLines)
+	ensureDir(OUT_DIR)
+	pcall(writefile, OUT_DIR .. "/values.txt", table.concat(valLines, "\n"))
+	pcall(writefile, OUT_DIR .. "/objects.txt", table.concat(objLines, "\n"))
+	return count, tagTable
+end
+
+-- who we are, where we are, on which build
+local function writeMeta()
+	local lines = {}
+	local Players = game:GetService("Players")
+	local lp = Players.LocalPlayer
+	local char = lp and lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+	local function add(key, fn)
+		local ok, v = pcall(fn)
+		table.insert(lines, string.format("%-14s %s", key .. ":", ok and tostring(v) or "?"))
+	end
+
+	add("PlaceId", function() return game.PlaceId end)
+	add("GameId", function() return game.GameId end)
+	add("Name", function() return game.Name end)
+	add("JobId", function() return game.JobId end)
+	add("PlaceVersion", function() return game.PlaceVersion end)
+	add("CreatorId", function() return game.CreatorId end)
+	add("Gravity", function() return Workspace.Gravity end)
+	add("CameraFOV", function() return Workspace.CurrentCamera.FieldOfView end)
+	add("LocalPlayer", function() return lp.Name .. " (" .. tostring(lp.UserId) .. ")" end)
+	add("Team", function() return lp.Team.Name end)
+	add("Character", function() return char.Name end)
+	add("Humanoid", function() return hum.Health .. "/" .. hum.MaxHealth end)
+	add("WalkSpeed", function() return hum.WalkSpeed end)
+	add("JumpPower", function() return hum.JumpPower end)
+	add("JumpHeight", function() return hum.JumpHeight end)
+
+	ensureDir(OUT_DIR)
+	pcall(writefile, OUT_DIR .. "/meta.txt", table.concat(lines, "\n"))
+	return lines
+end
+
+local function runIndexPhase(results, remoteList)
+	local prevScripts = readLines(OUT_DIR .. "/scripts.txt")
+
+	local ctx = {
+		callLines = {}, callLinesCount = 0, totalCalls = 0,
+		byOut = {}, byIn = {}, usage = {},
+	}
+	local allAttrs, allTags = {}, {}
+	local scriptInfos = {}
+	local totalReqs = 0
+
+	for _, item in ipairs(results) do
+		local where = (item.gamePath ~= "" and item.gamePath) or ("_misc/" .. tostring(item.tag))
+		local info = {
+			path = where, cls = item.cls or "?", rawName = item.rawName, lines = 0,
+			outRemotes = {}, inRemotes = {}, reqs = {}, funcs = {},
+			attrs = {}, tags = {}, refs = {}, services = {},
+		}
+
+		if item.src then
+			local okSite, errSite = pcall(scanRemoteSites, item.src, where, info, ctx)
+			if not okSite then
+				addLog("[ERR] sites " .. where .. ": " .. tostring(errSite), Color3.fromRGB(220, 80, 80))
+			end
+
+			local n = 0
+			for line in string.gmatch(item.src .. "\n", "([^\n]*)\n") do
+				n += 1
+				for a in string.gmatch(line, "Attribute%w*%(%s*[\"']([^\"']+)") do
+					allAttrs[a] = true
+					info.attrs[a] = true
+				end
+				for t in string.gmatch(line, "Tag%w*%(%s*[\"']([^\"']+)") do
+					allTags[t] = true
+					info.tags[t] = true
+				end
+				for r in string.gmatch(line, "WaitForChild%(%s*[\"']([^\"']+)") do
+					info.refs[r] = true
+				end
+				for r in string.gmatch(line, "FindFirstChild%(%s*[\"']([^\"']+)") do
+					info.refs[r] = true
+				end
+				for sv in string.gmatch(line, "GetService%(%s*[\"']([^\"']+)") do
+					info.services[sv] = true
+				end
+				local fname = string.match(line, "function%s+([%w_%.:]+)%s*%(")
+					or string.match(line, "([%w_%.:]+)%s*=%s*function")
+				if fname then
+					info.funcs[fname] = true
+				end
+				local req = string.match(line, "require%s*%((.-)%)")
+				if req then
+					info.reqs[cleanExpr(req)] = true
+					totalReqs += 1
+				end
+				if n % 500 == 0 then checkYield() end
+			end
+			info.lines = n
+		end
+
+		table.insert(scriptInfos, info)
+		checkYield()
+	end
+
+	local okDV, valueCount, tagTable = pcall(dumpValues)
+	if not okDV then
+		addLog("[ERR] values: " .. tostring(valueCount), Color3.fromRGB(220, 80, 80))
+		valueCount, tagTable = 0, {}
+	end
+	local okM, metaLines = pcall(writeMeta)
+	if not okM then metaLines = {} end
+
+	-- require(): map each expression to a dumped script when the name is unique
+	local nameToPaths = {}
+	for _, s in ipairs(scriptInfos) do
+		if s.rawName then
+			nameToPaths[s.rawName] = nameToPaths[s.rawName] or {}
+			table.insert(nameToPaths[s.rawName], s.path)
+		end
+	end
+	local requiredBy = {}
+	for _, s in ipairs(scriptInfos) do
+		s.reqResolved = {}
+		for raw in pairs(s.reqs) do
+			local nm = nameFromExpr(raw)
+			local targets = nil
+			if nm then targets = nameToPaths[nm] end
+			if targets and #targets == 1 then
+				s.reqResolved[raw] = targets[1]
+				requiredBy[targets[1]] = requiredBy[targets[1]] or {}
+				requiredBy[targets[1]][s.path] = true
+			elseif targets then
+				s.reqResolved[raw] = "ambiguous (" .. tostring(#targets) .. " matches)"
+			else
+				s.reqResolved[raw] = "not in dump"
+			end
+		end
+	end
+
+	local svcLines = {}
+	for _, svc in ipairs(game:GetChildren()) do
+		local okS, d = pcall(function() return #svc:GetDescendants() end)
+		table.insert(svcLines, string.format("  %-24s %s", svc.Name, okS and tostring(d) or "?"))
+		checkYield()
+	end
+	table.sort(svcLines)
+
+	local remLines, known = {}, {}
+	for _, p in ipairs(remoteList or {}) do
+		local short = string.match(p.path, "([^%.]+)$") or p.path
+		known[short] = true
+		table.insert(remLines, string.format("  %-28s out:%-4d in:%-4d [%s] %s",
+			short, ctx.byOut[short] or 0, ctx.byIn[short] or 0, p.cn, p.path))
+	end
+	for name, cnt in pairs(ctx.byOut) do
+		if not known[name] then
+			known[name] = true
+			table.insert(remLines, string.format("  %-28s out:%-4d in:%-4d [not in remote list]", name, cnt, ctx.byIn[name] or 0))
+		end
+	end
+	for name, cnt in pairs(ctx.byIn) do
+		if not known[name] then
+			known[name] = true
+			table.insert(remLines, string.format("  %-28s out:%-4d in:%-4d [not in remote list]", name, ctx.byOut[name] or 0, cnt))
+		end
+	end
+	table.sort(remLines)
+
+	local usageLines = {}
+	for _, name in ipairs(setToList(ctx.usage)) do
+		local u = ctx.usage[name]
+		table.insert(usageLines, name)
+		table.insert(usageLines, "    fired from: " .. joinSet(u.out, 30))
+		table.insert(usageLines, "    handled by: " .. joinSet(u["in"], 30))
+	end
+
+	local tagLines, tagKeys = {}, 0
+	for t, e in pairs(tagTable) do
+		tagKeys += 1
+		table.insert(tagLines, string.format("  %-28s x%-6d e.g. %s", t, e.count, e.example))
+	end
+	table.sort(tagLines)
+
+	table.sort(scriptInfos, function(a, b) return a.path < b.path end)
+	local scLines, scPaths = {}, {}
+	for _, s in ipairs(scriptInfos) do
+		table.insert(scPaths, string.format("[%s] %s", s.cls, s.path))
+		table.insert(scLines, string.format("[%s] %s  (%d lines)", s.cls, s.path, s.lines))
+
+		local rset = {}
+		for k in pairs(s.outRemotes) do rset[k .. " [out]"] = true end
+		for k in pairs(s.inRemotes) do rset[k .. " [in]"] = true end
+
+		local rows = {
+			{ "remotes:",  rset,                     40 },
+			{ "funcs:",    s.funcs,                  40 },
+			{ "attrs:",    s.attrs,                  40 },
+			{ "tags:",     s.tags,                   40 },
+			{ "services:", s.services,               20 },
+			{ "refs:",     s.refs,                   60 },
+			{ "usedby:",   requiredBy[s.path] or {}, 40 },
+		}
+		for _, row in ipairs(rows) do
+			local list = setToList(row[2], row[3])
+			if #list > 0 then
+				table.insert(scLines, string.format("    %-10s %s", row[1], table.concat(list, ", ")))
+			end
+		end
+
+		local reqRows = {}
+		for raw, target in pairs(s.reqResolved) do
+			table.insert(reqRows, raw .. " -> " .. target)
+		end
+		table.sort(reqRows)
+		for ri, r in ipairs(reqRows) do
+			if ri > 40 then break end
+			table.insert(scLines, "    requires:  " .. r)
+		end
+	end
+
+	ensureDir(OUT_DIR)
+	pcall(writefile, OUT_DIR .. "/scripts.txt", table.concat(scPaths, "\n"))
+	writeDiff(OUT_DIR .. "/changes_scripts.txt", "scripts", prevScripts, scPaths)
+	pcall(writefile, OUT_DIR .. "/call_sites.txt", table.concat(ctx.callLines, "\n"))
+	pcall(writefile, OUT_DIR .. "/remote_usage.txt", table.concat(usageLines, "\n"))
+	pcall(writefile, OUT_DIR .. "/tags.txt", table.concat(tagLines, "\n"))
+	if #aliasLines > 0 then
+		pcall(writefile, OUT_DIR .. "/aliases.txt", table.concat(aliasLines, "\n"))
+	end
+
+	local summary = {
+		"SUPER DUMPER INDEX",
+		"==================",
+		"files: summary.txt meta.txt remotes.txt remote_usage.txt call_sites.txt values.txt objects.txt tags.txt scripts.txt aliases.txt changes_*.txt captured_args.txt",
+		"note: Script (server) bodies are not readable from the client, so server handlers only show through the client's calls.",
+		"",
+	}
+	for _, l in ipairs(metaLines) do table.insert(summary, l) end
+	table.insert(summary, "")
+	table.insert(summary, string.format(
+		"Scripts: %d | Remotes: %d | Values/Attrs: %d | Tags: %d | Call sites: %d | Requires: %d | Aliases: %d",
+		#results, #(remoteList or {}), valueCount, tagKeys, ctx.totalCalls, totalReqs, #aliasLines))
+	table.insert(summary, "")
+	table.insert(summary, "SERVICES (descendant count)")
+	table.insert(summary, table.concat(svcLines, "\n"))
+	table.insert(summary, "")
+	table.insert(summary, "REMOTES (out = sent from code, in = handler on this side)")
+	table.insert(summary, table.concat(remLines, "\n"))
+	table.insert(summary, "")
+	table.insert(summary, "REMOTE USAGE (which scripts fire / handle each remote)")
+	table.insert(summary, table.concat(usageLines, "\n"))
+	table.insert(summary, "")
+	table.insert(summary, "ATTRIBUTES used in code: " .. joinSet(allAttrs, 100))
+	table.insert(summary, "TAGS used in code: " .. joinSet(allTags, 100))
+	table.insert(summary, "")
+	table.insert(summary, "SCRIPTS")
+	table.insert(summary, table.concat(scLines, "\n"))
+	pcall(writefile, OUT_DIR .. "/summary.txt", table.concat(summary, "\n"))
+
+	return ctx.totalCalls, totalReqs, valueCount
+end
+
+
+-- =================================================================
 -- MAIN 3-PHASE DUMP EXECUTION
 -- =================================================================
 local function executeDump()
@@ -1591,6 +2409,8 @@ local function executeDump()
 	total_luac  = 0
 	total_skip  = 0
 	global_seen_bc = {}
+	aliasLines = {}
+	sharedGC = nil
 	table.clear(allLogLabels)
 
 	for _, child in ipairs(LogScroll:GetChildren()) do
@@ -1624,7 +2444,9 @@ local function executeDump()
 	markPhaseActive("scan")
 	switchTab("Logs")
 
-	local queue = runScanPhase()
+	local queue = {}
+	local okS, errS = pcall(runScanPhase, queue)
+	if not okS then addLog("[ERR] scan: " .. tostring(errS), Color3.fromRGB(220, 80, 80)) end
 
 	markPhaseDone("scan", #queue)
 	addLog("", Color3.fromRGB(40, 40, 40))
@@ -1638,7 +2460,11 @@ local function executeDump()
 	addLog("╚══════════════════════════════════════╝", Color3.fromRGB(100, 180, 255))
 	markPhaseActive("decompile")
 
-	local results, gcClosures = runDecompilePhase(queue)
+	local okD, results, gcClosures = pcall(runDecompilePhase, queue)
+	if not okD then
+		addLog("[ERR] decompile: " .. tostring(results), Color3.fromRGB(220, 80, 80))
+		results, gcClosures = {}, {}
+	end
 
 	markPhaseDone("decompile", #results)
 	addLog("", Color3.fromRGB(40, 40, 40))
@@ -1652,9 +2478,32 @@ local function executeDump()
 	addLog("╚══════════════════════════════════════╝", Color3.fromRGB(80, 255, 140))
 	markPhaseActive("write")
 
-	runWritePhase(results, gcClosures)
+	local okW, errW = pcall(runWritePhase, results, gcClosures)
+	if not okW then addLog("[ERR] write: " .. tostring(errW), Color3.fromRGB(220, 80, 80)) end
 
 	markPhaseDone("write", total_lua)
+
+	-- ── EXTRA: REMOTES + FULL TREE ─────────────────────────────
+	setProgress("EXTRA: Remotes + full tree...")
+	addLog("╔══════════════════════════════════════╗", Color3.fromRGB(255, 200, 80))
+	addLog("║  🌐 EXTRA: REMOTES + FULL TREE        ║", Color3.fromRGB(255, 200, 80))
+	addLog("╚══════════════════════════════════════╝", Color3.fromRGB(255, 200, 80))
+	local okR, remoteCount, treeCount, remoteList = pcall(runRemotePhase)
+	if not okR then
+		addLog("[ERR] remote phase: " .. tostring(remoteCount), Color3.fromRGB(220, 80, 80))
+		remoteCount, treeCount, remoteList = 0, 0, {}
+	end
+
+	-- ── EXTRA: INDEX (call sites, values, summary) ─────────────
+	setProgress("INDEX: call sites + values + summary...")
+	addLog("╔══════════════════════════════════════╗", Color3.fromRGB(255, 160, 220))
+	addLog("║  🗂 INDEX: CALL SITES + SUMMARY       ║", Color3.fromRGB(255, 160, 220))
+	addLog("╚══════════════════════════════════════╝", Color3.fromRGB(255, 160, 220))
+	local okI, callCount, reqCount, valCount = pcall(runIndexPhase, results, remoteList or {})
+	if not okI then
+		addLog("[ERR] index phase: " .. tostring(callCount), Color3.fromRGB(220, 80, 80))
+		callCount, reqCount, valCount = 0, 0, 0
+	end
 
 	-- ── PODSUMOWANIE ──────────────────────────────────────────────
 	local elapsed = string.format("%.2fs", os.clock() - startTime)
@@ -1666,6 +2515,8 @@ local function executeDump()
 	addLog(string.format("  Saved: %d .lua  |  %d .luac  |  %d skipped", total_lua, total_luac, total_skip), Color3.fromRGB(200, 200, 200))
 	addLog("  Struktura: workspace/" .. OUT_DIR .. "/game_tree_1to1/", Color3.fromRGB(180, 180, 255))
 	addLog("  GC:        workspace/" .. OUT_DIR .. "/gc_closures/",    Color3.fromRGB(180, 180, 255))
+	addLog(string.format("  Remotes: %d  |  Tree: %d instances  ->  workspace/%s/", remoteCount, treeCount, OUT_DIR), Color3.fromRGB(180, 255, 180))
+	addLog(string.format("  Calls: %d  |  Requires: %d  |  Values/Attrs: %d  ->  workspace/%s/summary.txt", callCount, reqCount, valCount, OUT_DIR), Color3.fromRGB(255, 190, 230))
 	addLog("════════════════════════════════════════", Color3.fromRGB(150, 80, 255))
 end
 
@@ -1708,77 +2559,135 @@ CloseBtn.MouseButton1Click:Connect(function()
 end)
 
 -- =================================================================
--- SYSTEM HOOKS (DYNAMIC NETWORK EVENT SPY)
+-- RUNTIME CAPTURE: outgoing hook + incoming OnClientEvent listeners
 -- =================================================================
-local hasNetworkSpyHook = false
-local spyInitialized = false
+do
+	local CAPTURE_FILE = OUT_DIR .. "/captured_args.txt"
+	local CAPTURE_LIMIT = 50000
+	local spyInitialized = false
+	local incomingConns = {}
+	local capturedCount = 0
 
-function initializeNetworkSpy()
-	if spyInitialized then return end
-	spyInitialized = true
+	local function serializeValue(v, depth)
+		depth = depth or 0
+		local t = typeof(v)
+		if t == "string" then
+			return "\"" .. v .. "\""
+		elseif t == "number" or t == "boolean" or t == "nil" then
+			return tostring(v)
+		elseif t == "Instance" then
+			return "<" .. fullNameOf(v) .. ">"
+		elseif t == "table" then
+			if depth >= 3 then return "{...}" end
+			local parts, n = {}, 0
+			for k, val in pairs(v) do
+				n += 1
+				if n > 20 then
+					table.insert(parts, "...")
+					break
+				end
+				table.insert(parts, tostring(k) .. " = " .. serializeValue(val, depth + 1))
+			end
+			return "{" .. table.concat(parts, ", ") .. "}"
+		end
+		return t .. "(" .. tostring(v) .. ")"
+	end
 
-	pcall(function()
-		local remoteEvent = Instance.new("RemoteEvent")
-		if hookfunction and remoteEvent.FireServer then
-			local oldFireServer
-			oldFireServer = hookfunction(remoteEvent.FireServer, function(self, ...)
-				if Config.NetworkSpyActive then
-					local args = { ... }
+	local function formatArgs(...)
+		local n = select("#", ...)
+		if n == 0 then return "(no args)" end
+		local args = { ... }
+		local parts = {}
+		for i = 1, n do
+			table.insert(parts, "[" .. tostring(i) .. "] " .. serializeValue(args[i]))
+		end
+		return table.concat(parts, "  ")
+	end
+
+	local function captureWrite(text)
+		if capturedCount >= CAPTURE_LIMIT then return end
+		capturedCount += 1
+		logToFile(CAPTURE_FILE, text)
+		if capturedCount % 50 == 0 then
+			addLog("[CAPTURE] " .. tostring(capturedCount) .. " events logged", Color3.fromRGB(80, 220, 240))
+		end
+	end
+
+	local function hookOutgoing(className, methodName, label)
+		local ok, installed = pcall(function()
+			if not hookfunction then return false end
+			local probe = Instance.new(className)
+			local original = probe[methodName]
+			probe:Destroy()
+			if type(original) ~= "function" then return false end
+			local old
+			old = hookfunction(original, function(self, ...)
+				if Config.NetworkSpyActive and capturedCount < CAPTURE_LIMIT then
+					local selfPath = fullNameOf(self)
+					local callerPath = "?"
+					if getcallingscript then
+						local okC, cs = pcall(getcallingscript)
+						if okC and cs then callerPath = fullNameOf(cs) end
+					end
+					local argText = formatArgs(...)
 					task.spawn(function()
-						local argStrings = {}
-						for i, arg in ipairs(args) do
-							table.insert(argStrings, string.format("[%d] (%s) %s", i, type(arg), tostring(arg)))
-						end
-						local logMsg = string.format(
-							"[NETWORK EVENT] %s:FireServer()\nArguments:\n%s",
-							self:GetFullName(),
-							table.concat(argStrings, "\n")
-						)
-						logToFile(OUT_DIR .. "/network_remotes.log", logMsg)
-						addLog(string.format("📡 [EVENT] %s", self.Name), Color3.fromRGB(80, 220, 240))
+						captureWrite(string.format("[%s] %s  caller=%s\n    %s", label, selfPath, callerPath, argText))
 					end)
 				end
-				return oldFireServer(self, ...)
+				return old(self, ...)
 			end)
-			hasNetworkSpyHook = true
-		end
-	end)
+			return true
+		end)
+		return ok and installed == true
+	end
 
-	pcall(function()
-		local remoteFunc = Instance.new("RemoteFunction")
-		if hookfunction and remoteFunc.InvokeServer then
-			local oldInvokeServer
-			oldInvokeServer = hookfunction(remoteFunc.InvokeServer, function(self, ...)
-				if Config.NetworkSpyActive then
-					local args = { ... }
-					task.spawn(function()
-						local argStrings = {}
-						for i, arg in ipairs(args) do
-							table.insert(argStrings, string.format("[%d] (%s) %s", i, type(arg), tostring(arg)))
-						end
-						local logMsg = string.format(
-							"[NETWORK FUNCTION] %s:InvokeServer()\nArguments:\n%s",
-							self:GetFullName(),
-							table.concat(argStrings, "\n")
-						)
-						logToFile(OUT_DIR .. "/network_remotes.log", logMsg)
-						addLog(string.format("📡 [FUNC] %s", self.Name), Color3.fromRGB(240, 220, 80))
+	function initializeNetworkSpy()
+		if spyInitialized then return end
+		spyInitialized = true
+		local a = hookOutgoing("RemoteEvent", "FireServer", "FIRE")
+		local b = hookOutgoing("UnreliableRemoteEvent", "FireServer", "FIRE-U")
+		local c = hookOutgoing("RemoteFunction", "InvokeServer", "INVOKE")
+		local count = (a and 1 or 0) + (b and 1 or 0) + (c and 1 or 0)
+		if count > 0 then
+			addLog(string.format("[SYS] Outgoing capture: %d/3 hooks -> %s", count, CAPTURE_FILE), Color3.fromRGB(80, 250, 200))
+		else
+			addLog("[SYS] Outgoing capture failed (no hookfunction in executor).", Color3.fromRGB(250, 100, 100))
+		end
+	end
+
+	function setIncomingCapture(on)
+		for _, conn in ipairs(incomingConns) do
+			pcall(function() conn:Disconnect() end)
+		end
+		incomingConns = {}
+		if not on then
+			addLog("[SYS] Incoming capture OFF", Color3.fromRGB(180, 180, 180))
+			return
+		end
+		local count = 0
+		local okD, desc = pcall(function() return game:GetDescendants() end)
+		if okD and desc then
+			for _, inst in ipairs(desc) do
+				local cn = classOf(inst)
+				if cn == "RemoteEvent" or cn == "UnreliableRemoteEvent" then
+					local path = fullNameOf(inst)
+					local okC, conn = pcall(function()
+						return inst.OnClientEvent:Connect(function(...)
+							captureWrite("[IN] " .. path .. "\n    " .. formatArgs(...))
+						end)
 					end)
+					if okC and conn then
+						table.insert(incomingConns, conn)
+						count += 1
+					end
 				end
-				return oldInvokeServer(self, ...)
-			end)
-			hasNetworkSpyHook = true
+			end
 		end
-	end)
-
-	if hasNetworkSpyHook then
-		addLog("[SYS] Network Remote Spy successfully activated.", Color3.fromRGB(80, 250, 200))
-	else
-		addLog("[SYS] Activation failed (no hookfunction in executor).", Color3.fromRGB(250, 100, 100))
+		addLog(string.format("[SYS] Incoming capture ON: %d remote events listening (re-toggle after new remotes appear)", count), Color3.fromRGB(80, 250, 200))
 	end
 end
 
 addLog("Super Dumper Pro v5.0 (3-Phase) loaded.", Color3.fromRGB(150, 100, 255))
-addLog("[SYS] Phase 1: Scan (6 methods) | Phase 2: Decompile | Phase 3: Write 1:1", Color3.fromRGB(80, 200, 255))
+addLog("[SYS] Phase 1: Scan | Phase 2: Decompile | Phase 3: Write 1:1 | Extra: remotes, tree, index", Color3.fromRGB(80, 200, 255))
 addLog("Configure settings or click START DUMP.", Color3.fromRGB(160, 160, 170))
 updateStats()
