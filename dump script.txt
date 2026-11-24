@@ -1406,6 +1406,7 @@ local function runDecompilePhase(queue)
 	local gcClosures = {}  -- { name, src }
 	local seen_closure_key = {}
 	local doneCount  = 0
+	local medalFails = 0
 
 	addLog(string.format("Decompiling %d scripts...", #queue), Color3.fromRGB(100, 200, 255))
 
@@ -1474,11 +1475,19 @@ local function runDecompilePhase(queue)
 						local errMsg = "Error"
 						if not ok then errMsg = tostring(res)
 						elseif res then errMsg = "HTTP " .. tostring(res.StatusCode) .. " " .. tostring(res.Body) end
-						addLog("[MEDAL ERR] " .. baseName .. " -> " .. string.sub(errMsg, 1, 60), Color3.fromRGB(240, 100, 100))
-						logToFile(OUT_DIR .. "/decompile_errors.log", "Name: " .. baseName .. "\nPath: " .. gamePath .. "\nMedal Error: " .. tostring(errMsg))
+						medalFails += 1
+						if medalFails <= 3 then
+							addLog("[MEDAL ERR] " .. baseName .. " -> " .. string.sub(errMsg, 1, 60), Color3.fromRGB(240, 100, 100))
+							logToFile(OUT_DIR .. "/decompile_errors.log", "Name: " .. baseName .. "\nPath: " .. gamePath .. "\nMedal Error: " .. tostring(errMsg))
+						end
+						if medalFails == 3 then
+							Config.UseMedalDecompiler = false
+							addLog("[SYS] Medal unreachable 3x, switched off for this run (executor decompiler used)", Color3.fromRGB(255, 200, 80))
+						end
 					end
 				else
-					addLog("[MEDAL ERR] Brak funkcji HTTP (request)", Color3.fromRGB(240, 100, 100))
+					Config.UseMedalDecompiler = false
+					addLog("[SYS] no HTTP function for Medal, switched off for this run", Color3.fromRGB(255, 200, 80))
 				end
 			end
 
@@ -1686,11 +1695,29 @@ local REMOTE_CLASSES = {
 	RemoteEvent = true,
 	UnreliableRemoteEvent = true,
 	RemoteFunction = true,
+}
+local BINDABLE_CLASSES = {
 	BindableEvent = true,
 	BindableFunction = true,
 }
 
 
+-- CoreGui / CorePackages hold the executor's and Roblox's own UI: skip them in every listing
+local coreRoots = nil
+local function inCore(inst)
+	if not coreRoots then
+		coreRoots = {}
+		for _, name in ipairs({ "CoreGui", "CorePackages" }) do
+			local okS, svc = pcall(function() return game:GetService(name) end)
+			if okS and svc then table.insert(coreRoots, svc) end
+		end
+	end
+	for _, root in ipairs(coreRoots) do
+		local okD, inside = pcall(function() return inst:IsDescendantOf(root) end)
+		if okD and inside then return true end
+	end
+	return false
+end
 -- snapshot helpers: compare against the previous dump sitting in the same folder
 local function readLines(path)
 	local set = {}
@@ -1741,17 +1768,24 @@ end
 
 local function runRemotePhase()
 	local oldRemotes = readLines(OUT_DIR .. "/remotes.txt")
-	local seen, remotes, treeLines = {}, {}, {}
+	local seen, remotes, treeLines, bindables = {}, {}, {}, {}
 
 	local function visit(inst, nilTag)
 		if seen[inst] then return end
 		seen[inst] = true
+		if inCore(inst) then return end
 		local ok, cn = pcall(function() return inst.ClassName end)
 		if not ok or not cn then return end
+		if not nilTag then
+			local okP, par = pcall(function() return inst.Parent end)
+			if okP and par == nil then nilTag = true end
+		end
 		local full = fullNameOf(inst)
 		if nilTag then full = "[NIL] " .. full end
 		if REMOTE_CLASSES[cn] then
 			table.insert(remotes, { cn = cn, path = full })
+		elseif BINDABLE_CLASSES[cn] then
+			table.insert(bindables, { cn = cn, path = full })
 		end
 		if Config.DumpTree and #treeLines < Config.MaxTreeLines then
 			table.insert(treeLines, cn .. "  " .. full)
@@ -1806,6 +1840,12 @@ local function runRemotePhase()
 	if Config.DumpRemotes then
 		pcall(writefile, OUT_DIR .. "/remotes.txt", table.concat(rLines, "\n"))
 		writeDiff(OUT_DIR .. "/changes_remotes.txt", "remotes", oldRemotes, rLines)
+		table.sort(bindables, function(a, b) return a.path < b.path end)
+		local bLines = { "# " .. tostring(#bindables) .. " bindables (not remotes)", "" }
+		for _, b in ipairs(bindables) do
+			table.insert(bLines, string.format("[%s] %s", b.cn, b.path))
+		end
+		pcall(writefile, OUT_DIR .. "/bindables.txt", table.concat(bLines, "\n"))
 	end
 
 	if Config.DumpTree then
@@ -2090,48 +2130,49 @@ local function dumpValues()
 	local okD, desc = pcall(function() return game:GetDescendants() end)
 	if okD and desc then
 		for _, inst in ipairs(desc) do
-			local cn = classOf(inst)
+			if not inCore(inst) then
+				local cn = classOf(inst)
 
-			if VALUE_CLASSES[cn] then
-				local okV, v = pcall(function() return inst.Value end)
-				local vs = "?"
-				if okV then
-					if typeof(v) == "Instance" then vs = fullNameOf(v) else vs = tostring(v) end
-				end
-				table.insert(valLines, string.format("[%s] %s = %s", cn, fullNameOf(inst), vs))
-				count += 1
-			end
-
-			local props = OBJECT_PROPS[cn]
-			if props then
-				local parts = {}
-				for _, p in ipairs(props) do
-					local okP, pv = pcall(function() return inst[p] end)
-					table.insert(parts, p .. "=" .. (okP and tostring(pv) or "?"))
-				end
-				table.insert(objLines, string.format("[%s] %s  |  %s", cn, fullNameOf(inst), table.concat(parts, ", ")))
-			end
-
-			local okA, attrs = pcall(function() return inst:GetAttributes() end)
-			if okA and attrs then
-				for k, v in pairs(attrs) do
-					table.insert(valLines, string.format("[ATTR] %s @ %s = %s (%s)", tostring(k), fullNameOf(inst), tostring(v), typeof(v)))
+				if VALUE_CLASSES[cn] then
+					local okV, v = pcall(function() return inst.Value end)
+					local vs = "?"
+					if okV then
+						if typeof(v) == "Instance" then vs = fullNameOf(v) else vs = tostring(v) end
+					end
+					table.insert(valLines, string.format("[%s] %s = %s", cn, fullNameOf(inst), vs))
 					count += 1
 				end
-			end
 
-			local okT, tags = pcall(function() return inst:GetTags() end)
-			if okT and tags then
-				for _, t in ipairs(tags) do
-					local e = tagTable[t]
-					if not e then
-						e = { count = 0, example = fullNameOf(inst) }
-						tagTable[t] = e
+				local props = OBJECT_PROPS[cn]
+				if props then
+					local parts = {}
+					for _, p in ipairs(props) do
+						local okP, pv = pcall(function() return inst[p] end)
+						table.insert(parts, p .. "=" .. (okP and tostring(pv) or "?"))
 					end
-					e.count = e.count + 1
+					table.insert(objLines, string.format("[%s] %s  |  %s", cn, fullNameOf(inst), table.concat(parts, ", ")))
+				end
+
+				local okA, attrs = pcall(function() return inst:GetAttributes() end)
+				if okA and attrs then
+					for k, v in pairs(attrs) do
+						table.insert(valLines, string.format("[ATTR] %s @ %s = %s (%s)", tostring(k), fullNameOf(inst), tostring(v), typeof(v)))
+						count += 1
+					end
+				end
+
+				local okT, tags = pcall(function() return inst:GetTags() end)
+				if okT and tags then
+					for _, t in ipairs(tags) do
+						local e = tagTable[t]
+						if not e then
+							e = { count = 0, example = fullNameOf(inst) }
+							tagTable[t] = e
+						end
+						e.count = e.count + 1
+					end
 				end
 			end
-
 			checkYield()
 		end
 	end
@@ -2144,6 +2185,8 @@ local function dumpValues()
 	return count, tagTable
 end
 
+-- live state of the runtime hooks and listeners, shown in meta.txt
+local RuntimeState = { outgoingHooks = 0, incomingListeners = 0 }
 -- who we are, where we are, on which build
 local function writeMeta()
 	local lines = {}
@@ -2172,6 +2215,9 @@ local function writeMeta()
 	add("WalkSpeed", function() return hum.WalkSpeed end)
 	add("JumpPower", function() return hum.JumpPower end)
 	add("JumpHeight", function() return hum.JumpHeight end)
+	add("NetworkSpy", function() return Config.NetworkSpyActive and ("ON, outgoing hooks " .. tostring(RuntimeState.outgoingHooks) .. "/3") or "off" end)
+	add("CaptureIncoming", function() return Config.CaptureIncoming and ("ON, listeners " .. tostring(RuntimeState.incomingListeners)) or "off" end)
+	add("DecompileCap", function() return Config.MaxDecompileSize > 0 and (tostring(math.floor(Config.MaxDecompileSize / 1048576)) .. " MB") or "unlimited" end)
 
 	ensureDir(OUT_DIR)
 	pcall(writefile, OUT_DIR .. "/meta.txt", table.concat(lines, "\n"))
@@ -2228,8 +2274,7 @@ local function runIndexPhase(results, remoteList)
 				if fname then
 					info.funcs[fname] = true
 				end
-				local req = string.match(line, "require%s*%((.-)%)")
-				if req then
+				for req in string.gmatch(line, "require%s*%((.-)%)") do
 					info.reqs[cleanExpr(req)] = true
 					totalReqs += 1
 				end
@@ -2306,10 +2351,16 @@ local function runIndexPhase(results, remoteList)
 	end
 	table.sort(remLines)
 
+	local shortCount = {}
+	for _, p in ipairs(remoteList or {}) do
+		local sn = string.match(p.path, "([^%.]+)$") or p.path
+		shortCount[sn] = (shortCount[sn] or 0) + 1
+	end
 	local usageLines = {}
 	for _, name in ipairs(setToList(ctx.usage)) do
 		local u = ctx.usage[name]
-		table.insert(usageLines, name)
+		local copies = shortCount[name] or 0
+		table.insert(usageLines, copies > 1 and (name .. "  [" .. tostring(copies) .. " remotes share this name]") or name)
 		table.insert(usageLines, "    fired from: " .. joinSet(u.out, 30))
 		table.insert(usageLines, "    handled by: " .. joinSet(u["in"], 30))
 	end
@@ -2371,7 +2422,7 @@ local function runIndexPhase(results, remoteList)
 	local summary = {
 		"SUPER DUMPER INDEX",
 		"==================",
-		"files: summary.txt meta.txt remotes.txt remote_usage.txt call_sites.txt values.txt objects.txt tags.txt scripts.txt aliases.txt changes_*.txt captured_args.txt",
+		"files: summary.txt meta.txt remotes.txt remote_usage.txt call_sites.txt values.txt objects.txt tags.txt scripts.txt aliases.txt changes_*.txt captured_args.txt bindables.txt",
 		"note: Script (server) bodies are not readable from the client, so server handlers only show through the client's calls.",
 		"",
 	}
@@ -2623,16 +2674,19 @@ do
 			local old
 			old = hookfunction(original, function(self, ...)
 				if Config.NetworkSpyActive and capturedCount < CAPTURE_LIMIT then
-					local selfPath = fullNameOf(self)
-					local callerPath = "?"
-					if getcallingscript then
-						local okC, cs = pcall(getcallingscript)
-						if okC and cs then callerPath = fullNameOf(cs) end
-					end
-					local argText = formatArgs(...)
-					task.spawn(function()
-						captureWrite(string.format("[%s] %s  caller=%s\n    %s", label, selfPath, callerPath, argText))
-					end)
+					-- capture must never break the game's own call: anything that fails in here is swallowed
+					pcall(function(...)
+						local selfPath = fullNameOf(self)
+						local callerPath = "?"
+						if getcallingscript then
+							local okC, cs = pcall(getcallingscript)
+							if okC and cs then callerPath = fullNameOf(cs) end
+						end
+						local argText = formatArgs(...)
+						task.spawn(function()
+							captureWrite(string.format("[%s] %s  caller=%s\n    %s", label, selfPath, callerPath, argText))
+						end)
+					end, ...)
 				end
 				return old(self, ...)
 			end)
@@ -2648,6 +2702,7 @@ do
 		local b = hookOutgoing("UnreliableRemoteEvent", "FireServer", "FIRE-U")
 		local c = hookOutgoing("RemoteFunction", "InvokeServer", "INVOKE")
 		local count = (a and 1 or 0) + (b and 1 or 0) + (c and 1 or 0)
+		RuntimeState.outgoingHooks = count
 		if count > 0 then
 			addLog(string.format("[SYS] Outgoing capture: %d/3 hooks -> %s", count, CAPTURE_FILE), Color3.fromRGB(80, 250, 200))
 		else
@@ -2660,6 +2715,7 @@ do
 			pcall(function() conn:Disconnect() end)
 		end
 		incomingConns = {}
+		RuntimeState.incomingListeners = 0
 		if not on then
 			addLog("[SYS] Incoming capture OFF", Color3.fromRGB(180, 180, 180))
 			return
@@ -2683,6 +2739,7 @@ do
 				end
 			end
 		end
+		RuntimeState.incomingListeners = count
 		addLog(string.format("[SYS] Incoming capture ON: %d remote events listening (re-toggle after new remotes appear)", count), Color3.fromRGB(80, 250, 200))
 	end
 end
